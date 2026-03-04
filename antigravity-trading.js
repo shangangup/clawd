@@ -304,7 +304,11 @@ const CONFIG = {
 };
 
 // 后续信号追踪（影子模式）
-const FOLLOWUP_SHADOW = process.env.FOLLOWUP_SHADOW !== 'false'; // 默认true
+let FOLLOWUP_SHADOW = process.env.FOLLOWUP_SHADOW !== 'false'; // 默认true，可运行时回滚
+let FOLLOWUP_ERR_COUNT = 0;
+let FOLLOWUP_RECOVER_TIMER = null;
+let FOLLOWUP_HEALTH_COUNT = 0; // 断路器健康探测计数
+const FOLLOWUP_EXEC_DEDUP = new Map(); // message_id+action → timestamp
 const FOLLOWUP_LOG = '/home/botdrop/data/followup-shadow.jsonl';
 
 // 确保数据目录存在
@@ -952,6 +956,7 @@ async function executeTrade(signal, trader) {
     let orderResult = null;
     try {
       orderResult = await okxReq('POST', '/api/v5/trade/order', orderParams);
+      logTraceEvent(signal._traceId || signal._messageId || `trade_${Date.now()}`, 'EXECUTED', { trader, coin: signal.coin, side: signal.side, exec_code: orderResult.code, detail: { ordId: orderResult.data?.[0]?.ordId } });
     } catch (e) {
       const errMsg = e.message || 'unknown error';
       const errCategory = classifyOrderErrorCategory(errMsg);
@@ -1064,7 +1069,7 @@ async function executeTrade(signal, trader) {
           instId, tdMode: 'cross', side: closeSide,
           ordType: 'conditional', sz: tpSz,
           tpTriggerPx: signal.tp[i].toString(), tpOrdPx: '-1',
-          tpTriggerPxType: 'mark', reduceOnly: true
+          tpTriggerPxType: 'mark', reduceOnly: 'true'
         });
         console.log(`✅ 止盈${i+1}: ${signal.tp[i]} (${tpSz}张, ${(ratio*100).toFixed(0)}%)`);
       } catch (e) {
@@ -1168,6 +1173,7 @@ async function executeTradeFallback(signal, trader, instId, isLimit, closeSide, 
       sz: pos.contracts,
       ...(isLimit && { px: signal.entry.toString() })
     });
+    logTraceEvent(signal._traceId || signal._messageId || `trade_${Date.now()}`, 'EXECUTED', { trader, coin: signal.coin, side: signal.side, exec_code: orderResult.code, detail: { ordId: orderResult.data?.[0]?.ordId } });
     if (orderResult.code !== '0') {
       const errCategory = classifyOrderErrorCategory(orderResult.msg || '');
       console.log(`error_category: ${errCategory}`);
@@ -1264,7 +1270,7 @@ async function setStopLoss(instId, closeSide, sz, slPrice, orderId) {
       ordType: 'conditional', sz,
       slTriggerPx: slPrice.toString(), slOrdPx: '-1',
       slTriggerPxType: 'mark',  // 用标记价格，防插针
-      reduceOnly: true
+      reduceOnly: 'true'
     });
     if (slResult.code === '0') {
       return slResult.data[0].algoId;
@@ -1370,7 +1376,7 @@ async function emergencyClose(instId, closeSide, sz, reason, maxRetries = 5) {
 
       await okxReq('POST', '/api/v5/trade/order', {
         instId, tdMode: 'cross', side: closeSide, ordType: 'market',
-        sz: realSz, reduceOnly: true
+        sz: realSz, reduceOnly: 'true'
       });
       console.log(`✅ 紧急平仓成功(第${i+1}次): ${instId}`);
       await sendTG(`🛑 <b>紧急平仓成功</b>\n\n${instId}: ${reason}`);
@@ -1462,9 +1468,71 @@ async function initSignalDb() {
     // 幂等唯一索引（signal_id可为NULL，只对非NULL值做唯一约束）
     signalDb.run(`CREATE UNIQUE INDEX IF NOT EXISTS ux_signal_id ON signals(signal_id) WHERE signal_id IS NOT NULL`);
     fs.writeFileSync(dbPath, Buffer.from(signalDb.export()));
+
+    // Phase-A: 事件溯源表
+    signalDb.run(`CREATE TABLE IF NOT EXISTS signal_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      trace_id TEXT NOT NULL,
+      timestamp INTEGER,
+      trader TEXT,
+      channel_id TEXT,
+      stage TEXT NOT NULL,
+      action TEXT,
+      coin TEXT,
+      side TEXT,
+      entry_px REAL,
+      sl_px REAL,
+      exec_code TEXT,
+      detail TEXT,
+      error TEXT,
+      created_at TEXT DEFAULT (datetime('now'))
+    )`);
+    signalDb.run(`CREATE INDEX IF NOT EXISTS idx_event_trace ON signal_events(trace_id)`);
+    signalDb.run(`CREATE INDEX IF NOT EXISTS idx_event_stage ON signal_events(stage)`);
+    signalDb.run(`CREATE INDEX IF NOT EXISTS idx_event_trader ON signal_events(trader)`);
+    fs.writeFileSync(dbPath, Buffer.from(signalDb.export()));
+
     console.log('✅ Signal DB (SQLite) 初始化完成（含幂等索引）');
   } catch (e) {
     console.error('⚠️ Signal DB初始化失败:', e.message);
+  }
+}
+
+// Phase-A: 事件溯源记录
+let _eventWriteCount = 0;
+function logTraceEvent(traceId, stage, data = {}) {
+  if (!signalDb) return;
+  try {
+    signalDb.run(
+      `INSERT INTO signal_events (trace_id, timestamp, trader, channel_id, stage, action, coin, side, entry_px, sl_px, exec_code, detail, error)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        traceId,
+        Date.now(),
+        data.trader || null,
+        data.channel_id || null,
+        stage,
+        data.action || null,
+        data.coin || null,
+        data.side || null,
+        data.entry_px || null,
+        data.sl_px || null,
+        data.exec_code || null,
+        data.detail ? JSON.stringify(data.detail) : null,
+        data.error || null
+      ]
+    );
+    _eventWriteCount++;
+    // 每50次写入或距上次保存超过5分钟才export（降低IO压力）
+    if (_eventWriteCount >= 50) {
+      _eventWriteCount = 0;
+      try {
+        const fs = require('fs');
+        fs.writeFileSync('./data/signal-db.sqlite', Buffer.from(signalDb.export()));
+      } catch (e) { console.warn('signal_events export失败:', e.message); }
+    }
+  } catch (e) {
+    console.warn(`logTraceEvent失败 [${stage}]: ${e.message}`);
   }
 }
 
@@ -1524,80 +1592,54 @@ function getCurrentPositionList() {
 function classifyFollowupIntent(text, currentPositions = []) {
   const raw = String(text || '');
   const lower = raw.toLowerCase();
-  const result = {
-    action: 'INFO',
-    coin: null,
-    percent: 100,
-    is_be: false,
-    confidence: 0.3,
-    trigger_words: []
-  };
+  
+  // 前置过滤：开仓信号格式
+  const isNewOrderFormat = /trade setup|first entry|second entry|buy setup|sell setup|entry zone/i.test(raw) && /entry/i.test(raw);
+  if (isNewOrderFormat) {
+    return { action: 'INFO', coin: null, percent: 100, is_be: false, confidence: 0.1, trigger_words: ['new_order_format'], reason: 'NEW_ORDER_FORMAT' };
+  }
 
-  const COINS = ['BTC', 'ETH', 'SOL', 'NEAR', 'KAITO', 'BNB', 'XRP', 'ADA', 'DOGE', 'LINK', 'AVAX', 'DOT', 'MATIC', 'ARB', 'OP', 'SUI', 'APT', 'HYPE'];
-  const coinRe = new RegExp(`(?:\\$)?\\b(${COINS.join('|')})\\b`, 'i');
+  const result = { action: 'INFO', coin: null, percent: 100, is_be: false, confidence: 0.3, trigger_words: [] };
+  const COINS = ['BTC','ETH','SOL','NEAR','KAITO','BNB','XRP','ADA','DOGE','LINK','AVAX','DOT','MATIC','ARB','OP','SUI','APT','HYPE'];
+  const coinRe = new RegExp('(?:\\$)?\\b(' + COINS.join('|') + ')\\b', 'i');
   const cm = raw.match(coinRe);
   if (cm) result.coin = cm[1].toUpperCase();
-
   const add = (w) => { if (!result.trigger_words.includes(w)) result.trigger_words.push(w); };
 
   // CANCEL
-  if (/\bcancel\b|取消上条|ignore previous|撤销/i.test(raw)) {
-    result.action = 'CANCEL';
-    result.confidence = 0.95;
-    add('cancel');
-  }
+  if (/cancel|取消上条|ignore previous|撤销/i.test(raw)) { result.action = 'CANCEL'; result.confidence = 0.95; add('cancel'); }
 
-  // UPDATE_SL (必须有执行意图+止损/保本语义)
-  const hasMoveStop = /move\s+sl\s+to\s+breakeven|move\s+stop\s+to|sl\s*to\s*be|止损移保本|移到保本|止损\s*:\s*be|sl\s*:\s*be|stop\s*loss\s*to\s*entry/i.test(raw);
-  const hasBeAndStop = /(breakeven|保本)/i.test(raw) && /(\bsl\b|\bstop\b|止损|stop\s*loss)/i.test(raw);
+  // UPDATE_SL (breakeven)
+  const hasMoveStop = /move sl to breakeven|move stop to|sl to be|止损移保本|移到保本|止损.{0,2}be|sl.{0,2}be|stop loss to entry/i.test(raw);
+  const hasBeAndStop = /(breakeven|保本)/i.test(raw) && /(\bsl\b|\bstop\b|止损)/i.test(raw);
   if (hasMoveStop || hasBeAndStop) {
-    result.action = 'UPDATE_SL';
-    result.is_be = /(breakeven|\bbe\b|保本|entry)/i.test(raw);
-    result.confidence = 0.9;
+    result.action = 'UPDATE_SL'; result.is_be = true; result.confidence = 0.9;
     add(hasMoveStop ? 'move sl/stop' : 'breakeven+stop');
   }
 
-  // CLOSE (黑名单优先降级)
-  if (/close\s+to|not\s+close|will\s+close|close\s+above|close\s+below/i.test(lower)) {
-    result.action = 'INFO';
-    result.confidence = 0.2;
-    result.reason_code = 'BLACKLIST_HIT';
-    add('close_blacklist');
-  } else if (/\bclose\s+now\b|\bclose\s+all\b|全部平仓|平仓|\bexit\s+now\b|\bclose\s+position\b/i.test(raw)) {
-    result.action = 'CLOSE';
-    result.confidence = 0.92;
-    add('close');
+  // CLOSE — 黑名单先判断（UPDATE_SL优先，不被覆盖）
+  const isBlacklisted = /close to|not close|will close|close above|close below|already closed|已达到|已触发|tp\d+ hit|tp hit|tp\d+ on/i.test(raw);
+  if (isBlacklisted) {
+    result.action = 'INFO'; result.confidence = 0.2; add('close_blacklist');
+  } else if (result.action !== 'UPDATE_SL' && (/close all|全部平仓|平仓|exit now|close position/i.test(raw) || /\bclose now\b/i.test(raw) || /\ball positions\b/i.test(raw))) {
+    result.action = 'CLOSE'; result.confidence = 0.92; add('close');
   }
 
   // PARTIAL_TP
-  if (/\bclose\s*\d+%|\btake\s*\d+%|partial\s+close|分批止盈|\btp1\s*hit\b|\btp\s*hit\b|take\s+profit/i.test(raw)) {
+  if (/close \d+%|take \d+%|partial close|分批止盈|tp hit|take profit/i.test(raw)) {
     result.action = 'PARTIAL_TP';
     const pm = raw.match(/(\d+)\s*%/);
-    if (pm) result.percent = Math.max(1, Math.min(100, parseInt(pm[1], 10)));
-    result.confidence = 0.88;
-    add('partial_tp');
+    if (pm) result.percent = Math.max(1, Math.min(100, parseInt(pm[1])));
+    result.confidence = 0.88; add('partial_tp');
   }
 
-  // REVERSE (保留)
-  if (/reverse|反手|反向开仓/i.test(raw)) {
-    result.action = 'REVERSE';
-    result.confidence = 0.85;
-    add('reverse');
-  }
+  if (result.trigger_words.length === 0) { result.action = 'UNKNOWN'; result.confidence = 0.1; result.reason_code = 'NO_TRIGGER_MATCH'; }
 
-  // 如果没有识别到任何明确触发词
-  if (result.trigger_words.length === 0) {
-    result.action = 'UNKNOWN';
-    result.confidence = 0.1;
-    result.reason_code = 'NO_TRIGGER_MATCH';
-  }
-
-  // 持仓匹配逻辑
   const pos = Array.isArray(currentPositions) ? currentPositions : [];
   if (result.coin) {
-    const matched = pos.find((p) => String(p.coin || '').toUpperCase() === result.coin);
+    const matched = pos.find(p => String(p.coin || '').toUpperCase() === result.coin);
     result.matchedPosition = matched ? matched.instId : null;
-    if (!matched && ['UPDATE_SL', 'PARTIAL_TP', 'CLOSE', 'CANCEL', 'REVERSE'].includes(result.action)) {
+    if (!matched && ['UPDATE_SL','PARTIAL_TP','CLOSE','CANCEL','REVERSE'].includes(result.action)) {
       result.confidence = Math.max(0.35, result.confidence - 0.35);
       result.reason_code = result.reason_code || 'NO_POSITION_MATCH';
     }
@@ -1606,16 +1648,186 @@ function classifyFollowupIntent(text, currentPositions = []) {
       result.coin = String(pos[0].coin || '').toUpperCase() || null;
       result.matchedPosition = pos[0].instId || null;
       result.confidence = Math.max(0.1, result.confidence - 0.2);
-    } else if (pos.length > 1 && ['UPDATE_SL', 'PARTIAL_TP', 'CLOSE', 'CANCEL', 'REVERSE'].includes(result.action)) {
-      result.action = 'UNKNOWN';
-      result.reason = 'AMBIGUOUS_FOLLOWUP';
-      result.reason_code = 'AMBIGUOUS_FOLLOWUP';
-      result.confidence = 0.15;
-      result.matchedPosition = null;
+    } else if (pos.length > 1 && ['UPDATE_SL','PARTIAL_TP','CLOSE','CANCEL','REVERSE'].includes(result.action)) {
+      const isCloseAll = result.action === 'CLOSE' && (/close all/i.test(raw) || /all positions/i.test(raw) || /全部平仓/.test(raw));
+      if (isCloseAll) {
+        result.matchedPosition = 'ALL'; result.reason = 'CLOSE_ALL_EXPLICIT';
+      } else {
+        result.action = 'UNKNOWN'; result.reason = 'AMBIGUOUS_FOLLOWUP';
+        result.reason_code = 'AMBIGUOUS_FOLLOWUP'; result.confidence = 0.15; result.matchedPosition = null;
+      }
     }
   }
-
   return result;
+}
+
+async function executeUpdateSL(instId, traderName, intent) {
+  // 1) 查当前持仓
+  const pos = await okxReq('GET', '/api/v5/account/positions', null, { instType: 'SWAP' });
+  const livePos = (pos.data || []).find(p => p.instId === instId && parseFloat(p.pos) !== 0);
+  if (!livePos) return { success: false, error: 'NO_LIVE_POSITION' };
+
+  // 2) 计算保本价（加手续费偏移 0.08%）
+  const avgPx = parseFloat(livePos.avgPx || '0');
+  if (!avgPx || Number.isNaN(avgPx)) return { success: false, error: 'RETRY_AVG_PX_ZERO', retryable: true };
+  const isBuy = parseFloat(livePos.pos) > 0;
+
+  // Patch1: tickSz精度对齐
+  let tickSz = 0.1; // 默认值
+  try {
+    const insData = await okxReq('GET', '/api/v5/public/instruments', null, { instType: 'SWAP', instId });
+    tickSz = Number(insData.data?.[0]?.tickSz) || 0.1;
+  } catch (e) { console.warn('tickSz查询失败，使用默认0.1:', e.message); }
+  const rawBe = isBuy ? avgPx * 1.0008 : avgPx * 0.9992;
+  const q = rawBe / tickSz;
+  const be = (isBuy ? Math.ceil(q) : Math.floor(q)) * tickSz; // 多单上取整保护，空单下取整保护
+  const dp = (String(tickSz).split('.')[1] || '').length;
+  const bePx = be.toFixed(dp);
+
+  // 3) 查当前止损算法单
+  const algoOrders = await okxReq('GET', '/api/v5/trade/orders-algo-pending', null, { instId, ordType: 'conditional' });
+  const slOrder = (algoOrders.data || []).find(o => o.slTriggerPx && o.instId === instId);
+
+  if (slOrder) {
+    // 4a) amend 现有止损
+    const amendResult = await okxReq('POST', '/api/v5/trade/amend-algo-order', {
+      instId, algoId: slOrder.algoId, newSlTriggerPx: bePx, newSlOrdPx: '-1'
+    });
+
+    // Patch2: 硬口径 - 只认confirmed=true
+    if (amendResult.code !== '0') {
+      // 参数类错误（510xx）不重试
+      const errCode = String(amendResult.code || '');
+      if (errCode.startsWith('51') && errCode.length >= 4) {
+        return { success: false, confirmed: false, bePx, algoId: slOrder.algoId, error: `PARAM_ERROR:${amendResult.msg}` };
+      }
+      // 其他错误交给上层策略处理
+      return { success: false, confirmed: false, bePx, algoId: slOrder.algoId, error: amendResult.msg || 'AMEND_FAILED' };
+    }
+
+    // 带jitter的3次确认重试
+    let confirmed = false;
+    const delays = [200, 500, 1200];
+    for (let i = 0; i < 3 && !confirmed; i++) {
+      const jitter = Math.floor(Math.random() * 100);
+      await new Promise(r => setTimeout(r, delays[i] + jitter));
+      try {
+        const verify = await okxReq('GET', '/api/v5/trade/orders-algo-pending', null, { instId, algoId: slOrder.algoId });
+        const updated = verify.data?.[0];
+        if (updated) {
+          confirmed = Math.abs(Number(updated.slTriggerPx) - Number(bePx)) <= Math.max(Number(tickSz) / 2, 1e-8); // 太尉要求: tickSz/2精度
+        }
+      } catch (e) {
+        console.warn(`amend verify retry ${i+1} failed: ${e.message}`);
+      }
+    }
+
+    if (!confirmed) {
+      return { success: false, confirmed: false, bePx, algoId: slOrder.algoId, error: 'AMEND_NOT_CONFIRMED' };
+    }
+
+    return { success: true, confirmed: true, bePx, algoId: slOrder.algoId, error: null };
+  }
+
+  // 4b) 无现有止损则新挂
+  const sz = Math.abs(parseFloat(livePos.pos)).toString();
+  const closeSide = isBuy ? 'sell' : 'buy';
+  const newSL = await okxReq('POST', '/api/v5/trade/order-algo', {
+    instId,
+    tdMode: 'cross',
+    side: closeSide,
+    ordType: 'conditional',
+    sz,
+    slTriggerPx: bePx,
+    slOrdPx: '-1',
+    slTriggerPxType: 'mark',
+    reduceOnly: 'true'
+  });
+
+  return {
+    success: newSL.code === '0',
+    bePx,
+    confirmed: null,
+    algoId: newSL.data?.[0]?.algoId,
+    error: newSL.code === '0' ? null : (newSL.msg || 'CREATE_SL_FAILED')
+  };
+}
+
+async function executeClose(instId, traderName, intent) {
+  // instId === 'ALL' 时全平所有（仅在 classifyFollowupIntent 明确 close all 下进入）
+  if (intent?.matchedPosition === 'ALL' || instId === 'ALL') {
+    const pos = await okxReq('GET', '/api/v5/account/positions', null, { instType: 'SWAP' });
+    const positions = (pos.data || []).filter(p => parseFloat(p.pos) !== 0);
+    if (positions.length === 0) return { success: true, results: [], requested_all: true, closed_count: 0, remaining_count: 0 };
+
+    // Patch3: 并发平仓
+    const closeOne = async (p) => {
+      const sz = Math.abs(parseFloat(p.pos)).toString();
+      const side = parseFloat(p.pos) > 0 ? 'sell' : 'buy';
+      try {
+        const r = await okxReq('POST', '/api/v5/trade/order', {
+          instId: p.instId, tdMode: 'cross', side, ordType: 'market', sz, reduceOnly: 'true'
+        });
+        return { instId: p.instId, success: r.code === '0', ordId: r.data?.[0]?.ordId, error: r.code === '0' ? null : (r.msg || 'CLOSE_FAILED') };
+      } catch (e) {
+        return { instId: p.instId, success: false, error: e.message };
+      }
+    };
+    const results = await Promise.all(positions.map(closeOne));
+
+    // 二次核验：检查是否还有剩余仓位
+    await new Promise(r => setTimeout(r, 1500));
+    const pos2 = await okxReq('GET', '/api/v5/account/positions', null, { instType: 'SWAP' });
+    let remaining = (pos2.data || []).filter(p => parseFloat(p.pos) !== 0);
+
+    if (remaining.length > 0) {
+      // 再尝试一次
+      const retryResults = await Promise.all(remaining.map(closeOne));
+      results.push(...retryResults);
+      await new Promise(r => setTimeout(r, 1000));
+      const pos3 = await okxReq('GET', '/api/v5/account/positions', null, { instType: 'SWAP' });
+      remaining = (pos3.data || []).filter(p => parseFloat(p.pos) !== 0);
+    }
+
+    const closedCount = positions.length - remaining.length;
+    if (remaining.length > 0) {
+      // 区分幻影残仓（结算延迟，pos极小）和真实残仓
+      const realRemaining = remaining.filter(p => Math.abs(parseFloat(p.pos)) >= 1);
+      if (realRemaining.length > 0) {
+        // 真实残仓 → 高优先级告警
+        await sendTG(`🚨 <b>全平部分失败（高优先级）</b>\n\n请求平仓: ${positions.length}个\n已平: ${closedCount}个\n❌ 剩余: ${realRemaining.map(p => p.instId).join(', ')}`);
+        return { success: false, results, error: 'CLOSE_ALL_PARTIAL', requested_all: true, closed_count: closedCount, remaining_count: realRemaining.length, remaining: realRemaining.map(p => p.instId) };
+      } else {
+        // 幻影残仓（结算延迟）→ info级别不触发告警风暴
+        console.log(`ℹ️ [CLOSE_ALL] 幻影残仓疑似结算延迟: ${remaining.map(p => p.instId + ':' + p.pos).join(', ')}`);
+        await sendTG(`ℹ️ <b>全平完成（极小残仓，疑似结算延迟）</b>\n\n${remaining.map(p => p.instId + ':' + p.pos).join(', ')}`);
+      }
+    }
+    return { success: true, results, requested_all: true, closed_count: closedCount, remaining_count: 0 };
+  }
+
+  // 单币种平仓
+  const pos = await okxReq('GET', '/api/v5/account/positions', null, { instType: 'SWAP' });
+  const livePos = (pos.data || []).find(p => p.instId === instId && parseFloat(p.pos) !== 0);
+  if (!livePos) return { success: false, error: 'NO_LIVE_POSITION' };
+
+  const sz = Math.abs(parseFloat(livePos.pos)).toString();
+  const side = parseFloat(livePos.pos) > 0 ? 'sell' : 'buy';
+  const r = await okxReq('POST', '/api/v5/trade/order', {
+    instId,
+    tdMode: 'cross',
+    side,
+    ordType: 'market',
+    sz,
+    reduceOnly: 'true'
+  });
+
+  return {
+    success: r.code === '0',
+    ordId: r.data?.[0]?.ordId,
+    sz,
+    error: r.code === '0' ? null : (r.msg || 'CLOSE_FAILED')
+  };
 }
 
 async function logFollowupShadow(entry) {
@@ -1635,6 +1847,9 @@ async function handleDiscordMessage(message) {
   
   const trader = channelConfig.name;
   const group = channelConfig.group;
+
+  const traceId = message.id; // Discord Snowflake ID = 天然TraceID
+  logTraceEvent(traceId, 'RECEIVED', { trader: message.author?.username, channel_id: message.channel?.id });
   
   // 提取文字内容（优先 embed）
   let textPreview = '';
@@ -1693,16 +1908,18 @@ async function handleDiscordMessage(message) {
   }
 
   const signal = await visionParser.parseDiscordMessage(message, trader);
+  logTraceEvent(traceId, 'PARSED', { trader, coin: signal.coin, side: signal.side, entry_px: signal.entry, sl_px: signal.sl, detail: { tp: signal.tp, leverage: signal.leverage } });
   const textContent = String(message._overrideText || textPreview || message.content || '');
 
   // 后续信号分类（Phase-1 影子模式）
   const followupIntent = classifyFollowupIntent(textContent, getCurrentPositionList());
+  logTraceEvent(traceId, 'FOLLOWUP', { trader, action: followupIntent.action, coin: followupIntent.coin, detail: { confidence: followupIntent.confidence, trigger_words: followupIntent.trigger_words, matched: followupIntent.matchedPosition, reason: followupIntent.reason } });
   if (followupIntent.action !== 'INFO' && followupIntent.action !== 'UNKNOWN') {
     // 有意图信号，记录影子日志
     const matched = followupIntent.coin
       ? `${followupIntent.coin}-USDT-SWAP`
       : (followupIntent.matchedPosition || null);
-    await logFollowupShadow({
+    const followupEntry = {
       ts: Date.now(),
       trader,
       channelId,
@@ -1712,17 +1929,117 @@ async function handleDiscordMessage(message) {
       would_execute: !FOLLOWUP_SHADOW,
       shadow_reason: FOLLOWUP_SHADOW ? 'FOLLOWUP_SHADOW=true' : 'live',
       reason_code: (
-        followupIntent.reason === 'AMBIGUOUS_FOLLOWUP' ? 'AMBIGUOUS_FOLLOWUP' :
+        followupIntent.action === 'UNKNOWN' && followupIntent.matchedPosition === null ? 'AMBIGUOUS_FOLLOWUP' :
         (followupIntent.trigger_words || []).includes('close_blacklist') ? 'BLACKLIST_HIT' :
         !matched ? 'NO_POSITION_MATCH' :
         followupIntent.action === 'UNKNOWN' ? 'UNKNOWN_INTENT' : 'OK'
-      ),
-      reason_code: followupIntent.reason_code || null
-    });
+      )
+    };
+    await logFollowupShadow(followupEntry);
     console.log(`🔍 [FollowupShadow] ${trader} ${followupIntent.action} coin=${followupIntent.coin || '?'} conf=${followupIntent.confidence} matched=${matched || 'none'}`);
-    // Phase-1: 影子模式下不执行，只记录
+
     if (FOLLOWUP_SHADOW) {
-      // 不return，让后续逻辑继续（确保不影响现有开仓流程）
+      // 影子模式：只记录不执行，不return，保持旧逻辑
+    } else if (['UPDATE_SL', 'CLOSE'].includes(followupIntent.action) && matched) {
+      // Phase-2 执行层
+      // Patch5: 幂等锁 — 同一message_id+action只执行一次
+      const dedupKey = `${message.id || ''}:${followupIntent.action}:${matched}`;
+      if (FOLLOWUP_EXEC_DEDUP.has(dedupKey)) {
+        console.log(`⏭️ [FollowupExec] 幂等拦截: ${dedupKey}`);
+        logTraceEvent(traceId, 'DEDUP_HIT', { trader, action: followupIntent.action, detail: { key: dedupKey || bizKey } });
+        return;
+      }
+      FOLLOWUP_EXEC_DEDUP.set(dedupKey, Date.now());
+
+      // 业务级去重：trader+instId+action 10秒窗口（防同内容双发不同message_id）
+      const bizKey = `${trader}:${matched}:${followupIntent.action}`;
+      const bizTs = FOLLOWUP_EXEC_DEDUP.get('biz:' + bizKey);
+      if (bizTs && Date.now() - bizTs < 10000) {
+        console.log(`⏭️ [FollowupExec] 业务去重拦截(10s): ${bizKey}`);
+        logTraceEvent(traceId, 'DEDUP_HIT', { trader, action: followupIntent.action, detail: { key: dedupKey || bizKey } });
+        return;
+      }
+      FOLLOWUP_EXEC_DEDUP.set('biz:' + bizKey, Date.now());
+      // 清理超过5分钟的旧key
+      const now = Date.now();
+      for (const [k, ts] of FOLLOWUP_EXEC_DEDUP) {
+        if (now - ts > 5 * 60 * 1000) FOLLOWUP_EXEC_DEDUP.delete(k);
+      }
+      try {
+        let execResult;
+        if (followupIntent.action === 'UPDATE_SL') {
+          execResult = await executeUpdateSL(matched, trader, followupIntent);
+          if (execResult.success) {
+            console.log(`✅ [FollowupExec] UPDATE_SL成功: ${matched} bePx=${execResult.bePx} confirmed=${execResult.confirmed}`);
+            await sendTG(
+              `✅ <b>止损已移到保本</b>\n\n交易员: ${trader}\n${matched}\n保本价: ${execResult.bePx}\n确认: ${execResult.confirmed ? '✅' : '⚠️待确认'}`
+            );
+          } else {
+            await sendTG(`⚠️ <b>止损移保本失败</b>\n\n${trader} ${matched}: ${execResult.error || '未知错误'}`);
+          }
+        } else if (followupIntent.action === 'CLOSE') {
+          execResult = await executeClose(matched, trader, followupIntent);
+          if (execResult.success) {
+            console.log(`✅ [FollowupExec] CLOSE成功: ${matched}`);
+            await sendTG(`✅ <b>平仓已执行</b>\n\n交易员: ${trader}\n${matched}`);
+          } else {
+            await sendTG(`⚠️ <b>平仓失败</b>\n\n${trader} ${matched}: ${execResult.error || '未知错误'}`);
+          }
+        }
+
+        logTraceEvent(traceId, execResult.success ? 'CONFIRMED' : 'FAILED', { trader, action: followupIntent.action, coin: followupIntent.coin, exec_code: execResult.success ? 'OK' : execResult.error, detail: execResult });
+
+        if (execResult?.success) {
+          FOLLOWUP_ERR_COUNT = 0; // 成功清零
+          // 断路器半开期间：健康探测计数，达2次才真正恢复
+          if (FOLLOWUP_SHADOW && !FOLLOWUP_RECOVER_TIMER) {
+            FOLLOWUP_HEALTH_COUNT = (FOLLOWUP_HEALTH_COUNT || 0) + 1;
+            if (FOLLOWUP_HEALTH_COUNT >= 2) {
+              FOLLOWUP_SHADOW = false;
+              FOLLOWUP_HEALTH_COUNT = 0;
+              console.log('✅ [FollowupExec] 断路器恢复：2次健康探测通过');
+              sendTG('✅ <b>断路器恢复</b>\n\nFOLLOWUP_SHADOW=false（2次健康探测通过）');
+            }
+          } else {
+            FOLLOWUP_HEALTH_COUNT = 0;
+          }
+        }
+
+        await logFollowupShadow({
+          ...followupEntry,
+          ts_exec: Date.now(),
+          executed: true,
+          exec_result: execResult
+        });
+      } catch (e) {
+        console.error(`❌ [FollowupExec] 执行异常: ${e.message}`);
+        // Patch4: 断路器 — 连续3次失败才降级，30分钟自动恢复
+        FOLLOWUP_ERR_COUNT++;
+        if (FOLLOWUP_ERR_COUNT >= 3) {
+          logTraceEvent(traceId, 'CIRCUIT_TRIP', { trader, error: e.message, detail: { err_count: FOLLOWUP_ERR_COUNT } });
+          FOLLOWUP_SHADOW = true;
+          if (!FOLLOWUP_RECOVER_TIMER) {
+            // 30分钟后进入半开状态（half-open），需2次健康探测才真正恢复
+            FOLLOWUP_RECOVER_TIMER = setTimeout(() => {
+              FOLLOWUP_RECOVER_TIMER = null;
+              console.log('🔄 [FollowupExec] 断路器半开：等待健康探测');
+              sendTG('⏳ <b>断路器半开</b>\n\n30分钟冷却完成，等待2次健康探测后恢复');
+            }, 30 * 60 * 1000);
+          }
+        }
+        await sendTG(
+          `❌ <b>后续信号执行异常</b>\n\n${trader} ${matched}: ${e.message}\n` +
+          `🛡️ 已自动回滚：FOLLOWUP_SHADOW=true`
+        );
+        await logFollowupShadow({
+          ...followupEntry,
+          ts_exec: Date.now(),
+          executed: false,
+          rollback_shadow: true,
+          exec_error: e.message
+        });
+      }
+      return; // 执行完不走后续开仓/更新流程
     }
   }
   
@@ -1759,7 +2076,7 @@ async function handleDiscordMessage(message) {
 
         const closeResult = await okxReq('POST', '/api/v5/trade/order', {
           instId: ledgerPos.instId, tdMode: 'cross', side: closeSide,
-          ordType: 'market', sz: realContracts, reduceOnly: true
+          ordType: 'market', sz: realContracts, reduceOnly: 'true'
         });
         if (closeResult.code === '0') {
           console.log(`✅ [${trader}] 平仓成功: ${ledgerPos.instId}`);
@@ -1791,7 +2108,7 @@ async function handleDiscordMessage(message) {
           const closeSide = dir === 'buy' ? 'sell' : 'buy';
           console.log(`⚠️ [${trader}] 台账无记录但OKX有仓位，执行平仓: ${instId} ${sz}张`);
           const closeResult = await okxReq('POST', '/api/v5/trade/order', {
-            instId, tdMode: 'cross', side: closeSide, ordType: 'market', sz, reduceOnly: true
+            instId, tdMode: 'cross', side: closeSide, ordType: 'market', sz, reduceOnly: 'true'
           });
           if (closeResult.code === '0') {
             await sendTG(`✅ <b>平仓已执行（OKX直查）</b>\n\n交易员: ${trader}\n${instId} ${sz}张\n订单: <code>${closeResult.data?.[0]?.ordId || 'OK'}</code>`);
@@ -1882,7 +2199,7 @@ async function handleDiscordMessage(message) {
               instId: ledgerPos.instId, tdMode: 'cross', side: closeSide,
               ordType: 'conditional', sz: tpSz,
               tpTriggerPx: signal.tp[i].toString(), tpOrdPx: '-1',
-              tpTriggerPxType: 'mark', reduceOnly: true
+              tpTriggerPxType: 'mark', reduceOnly: 'true'
             });
             if (tpResult.code === '0') {
               results.push(`✅ 止盈${i+1}: ${signal.tp[i]}`);
@@ -2192,6 +2509,7 @@ async function handleDiscordMessage(message) {
 
   // 风控验证
   const riskResult = await riskControl.validateTrade(signal, message.createdTimestamp);
+  logTraceEvent(traceId, riskResult.approved ? 'RISK_PASSED' : 'RISK_REJECTED', { trader, coin: signal.coin, detail: { reason: riskResult.reason } });
   
   if (!riskResult.approved) {
     console.log(`🚫 [${trader}] 风控拒绝`);
@@ -2212,6 +2530,7 @@ async function handleDiscordMessage(message) {
   signal._traderWeight = traderWeight;
   signal._traderName = trader;
   signal._messageId = message.id; // 传入messageId供commitDedupRecord使用
+  signal._traceId = traceId;
   
   // 执行交易
   console.log(`✅ [${trader}] 风控通过，执行交易...`);
