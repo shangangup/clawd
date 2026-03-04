@@ -20,6 +20,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
+const WebSocket = require('ws');
 
 // ============== OKX IP直连修复 ==============
 // Termux 环境 www.okx.com DNS 被污染 → 198.18.0.13（私有地址），TLS必败
@@ -310,6 +311,15 @@ let FOLLOWUP_RECOVER_TIMER = null;
 let FOLLOWUP_HEALTH_COUNT = 0; // 断路器健康探测计数
 const FOLLOWUP_EXEC_DEDUP = new Map(); // message_id+action → timestamp
 const FOLLOWUP_LOG = '/home/botdrop/data/followup-shadow.jsonl';
+
+// Phase-B: OKX WebSocket持仓实时同步
+let wsOkxClient = null;
+let wsPingTimer = null;
+let wsPositionsCache = new Map(); // instId -> positionData
+let wsOrdersCache = new Map();    // ordId -> orderData
+let wsReady = false;              // WS就绪标志（收到首帧才true）
+let wsReconnecting = false;
+let wsReconnectDelay = 5000;
 
 // 确保数据目录存在
 if (!fs.existsSync(CONFIG.logging.dir)) fs.mkdirSync(CONFIG.logging.dir, { recursive: true });
@@ -1436,6 +1446,96 @@ function isSignalDuplicate(signalId) {
 }
 
 // ============== Signal DB (SQLite持久化) ==============
+// Phase-B: OKX Private WebSocket管理器
+function initOkxWS() {
+  if (wsOkxClient) {
+    clearInterval(wsPingTimer);
+    try { wsOkxClient.terminate(); } catch(e) {}
+  }
+  wsOkxClient = null;
+  wsReconnecting = false;
+
+  const wsUrl = CONFIG.okx.useDemo
+    ? 'wss://wspap.okx.com:8443/ws/v5/private'
+    : 'wss://ws.okx.com:8443/ws/v5/private';
+
+  console.log(`🔌 [OKX-WS] 连接 ${wsUrl}`);
+  const ws = new WebSocket(wsUrl);
+  wsOkxClient = ws;
+
+  ws.on('open', () => {
+    wsReconnectDelay = 5000; // 重置退避
+    // 登录认证（timestamp用秒）
+    const ts = Math.floor(Date.now() / 1000).toString();
+    const sign = require('crypto')
+      .createHmac('sha256', CONFIG.okx.secretKey)
+      .update(ts + 'GET' + '/users/self/verify')
+      .digest('base64');
+    ws.send(JSON.stringify({
+      op: 'login',
+      args: [{ apiKey: CONFIG.okx.apiKey, passphrase: CONFIG.okx.passphrase, timestamp: ts, sign }]
+    }));
+    // 心跳（单例，防泄露）
+    wsPingTimer = setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) ws.send('ping');
+    }, 25000);
+    console.log('🔌 [OKX-WS] 已连接，等待登录...');
+  });
+
+  ws.on('message', (raw) => {
+    const msg = raw.toString();
+    if (msg === 'pong') return;
+    let data;
+    try { data = JSON.parse(msg); } catch(e) { return; }
+
+    if (data.event === 'login' && data.code === '0') {
+      console.log('✅ [OKX-WS] 登录成功，订阅持仓和订单...');
+      ws.send(JSON.stringify({ op: 'subscribe', args: [
+        { channel: 'positions', instType: 'SWAP' },
+        { channel: 'orders', instType: 'SWAP' }
+      ]}));
+    }
+
+    if (data.arg?.channel === 'positions' && data.data) {
+      data.data.forEach(p => wsPositionsCache.set(p.instId, p));
+      // 清理零持仓（防内存膨胀）
+      for (const [k, v] of wsPositionsCache) {
+        if (parseFloat(v.pos) === 0) wsPositionsCache.delete(k);
+      }
+      if (!wsReady) {
+        wsReady = true;
+        console.log(`✅ [OKX-WS] 首帧持仓数据就绪，持仓数: ${wsPositionsCache.size}`);
+      }
+    }
+
+    if (data.arg?.channel === 'orders' && data.data) {
+      data.data.forEach(o => {
+        if (['filled', 'canceled', 'partially_filled'].includes(o.state)) {
+          // 已完成订单定时清理，避免OOM
+          setTimeout(() => wsOrdersCache.delete(o.ordId), 60000);
+        }
+        wsOrdersCache.set(o.ordId, o);
+      });
+    }
+  });
+
+  const handleReconnect = (reason) => {
+    if (wsReconnecting) return; // 防并发重连
+    wsReconnecting = true;
+    wsReady = false;
+    clearInterval(wsPingTimer);
+    console.log(`🔄 [OKX-WS] 断开(${reason})，${wsReconnectDelay/1000}秒后重连...`);
+    setTimeout(initOkxWS, wsReconnectDelay);
+    wsReconnectDelay = Math.min(wsReconnectDelay * 2, 30000); // 指数退避，最长30秒
+  };
+
+  ws.on('close', () => handleReconnect('close'));
+  ws.on('error', (e) => {
+    console.error('❌ [OKX-WS] 错误:', e.message);
+    handleReconnect('error');
+  });
+}
+
 let signalDb = null;
 async function initSignalDb() {
   try {
@@ -1578,15 +1678,21 @@ function saveSignalLog(channelId, trader, signal, action, reject_reason) {
 }
 
 
-function getCurrentPositionList() {
-  if (!global.ledger || !global.ledger.positions) return [];
-  return Array.from(global.ledger.positions.entries())
-    .filter(([k, v]) => v && parseFloat(v.contracts) > 0)
-    .map(([k, v]) => ({
-      instId: k,
-      coin: k.replace('-USDT-SWAP', '').replace('-USDT-PERP', '').toUpperCase(),
-      direction: v.direction
-    }));
+// Phase-B: 优先用WS缓存，降级用REST
+async function getCurrentPositionList() {
+  if (wsReady && wsPositionsCache.size >= 0) {
+    const positions = [...wsPositionsCache.values()].filter(p => parseFloat(p.pos) !== 0);
+    return positions;
+  }
+  // 降级：WS未就绪时用REST API
+  console.log('⚠️ [OKX-WS] WS未就绪，降级使用REST API获取持仓...');
+  try {
+    const res = await okxReq('GET', '/api/v5/account/positions?instType=SWAP');
+    return (res.data || []).filter(p => parseFloat(p.pos) !== 0);
+  } catch(e) {
+    console.error('❌ [OKX-WS] REST降级失败:', e.message);
+    return [];
+  }
 }
 
 function classifyFollowupIntent(text, currentPositions = []) {
@@ -1912,7 +2018,7 @@ async function handleDiscordMessage(message) {
   const textContent = String(message._overrideText || textPreview || message.content || '');
 
   // 后续信号分类（Phase-1 影子模式）
-  const followupIntent = classifyFollowupIntent(textContent, getCurrentPositionList());
+  const followupIntent = classifyFollowupIntent(textContent, await getCurrentPositionList());
   logTraceEvent(traceId, 'FOLLOWUP', { trader, action: followupIntent.action, coin: followupIntent.coin, detail: { confidence: followupIntent.confidence, trigger_words: followupIntent.trigger_words, matched: followupIntent.matchedPosition, reason: followupIntent.reason } });
   if (followupIntent.action !== 'INFO' && followupIntent.action !== 'UNKNOWN') {
     // 有意图信号，记录影子日志
@@ -2845,6 +2951,8 @@ process.on('unhandledRejection', async (reason) => {
 // ============== 启动 ==============
 console.log('🚀 正在连接 Discord...\n');
 initSignalDb(); // Signal DB初始化
+// Phase-B: 启动OKX WebSocket
+initOkxWS();
 client.login(CONFIG.discordToken).catch(async (err) => {
   console.error('❌ 登录失败:', err.message);
   await sendTG(`🔴 <b>Discord 登录失败</b>\n\n${err.message}`);
