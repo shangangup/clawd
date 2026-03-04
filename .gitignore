@@ -1,0 +1,9 @@
+.env
+*.log
+data/*.sqlite
+data/*.jsonl
+data/positions*.jsonl
+data/archive/
+node_modules/
+*.tmp
+.env.bak
