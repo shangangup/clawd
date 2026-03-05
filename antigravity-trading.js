@@ -1446,7 +1446,25 @@ function isSignalDuplicate(signalId) {
 }
 
 // ============== Signal DB (SQLite持久化) ==============
-// Phase-B: OKX Private WebSocket管理器
+// Phase-C: 日志滚动（按行切割，安全不破坏jsonl）
+let _msgProcessCount = 0;
+function rotateLogFile(filePath, maxLines = 5000, keepLines = 1000) {
+  try {
+    if (!fs.existsSync(filePath)) return;
+    const content = fs.readFileSync(filePath, 'utf8');
+    const lines = content.split('\n').filter(l => l.trim());
+    if (lines.length > maxLines) {
+      fs.writeFileSync(filePath, lines.slice(-keepLines).join('\n') + '\n');
+      console.log(`🗂️ [日志轮转] ${filePath}: ${lines.length}行 → 保留最后${keepLines}行`);
+    }
+  } catch(e) { console.warn('日志轮转失败:', e.message); }
+}
+function checkLogRotation() {
+  rotateLogFile('/home/botdrop/data/antigravity.log', 10000, 2000);
+  rotateLogFile(FOLLOWUP_LOG, 3000, 500);
+}
+
+
 function initOkxWS() {
   if (wsOkxClient) {
     clearInterval(wsPingTimer);
@@ -1956,6 +1974,9 @@ async function handleDiscordMessage(message) {
 
   const traceId = message.id; // Discord Snowflake ID = 天然TraceID
   logTraceEvent(traceId, 'RECEIVED', { trader: message.author?.username, channel_id: message.channel?.id });
+  // Phase-C: 每1000条消息检查日志大小
+  _msgProcessCount++;
+  if (_msgProcessCount % 1000 === 0) checkLogRotation();
   
   // 提取文字内容（优先 embed）
   let textPreview = '';
@@ -2013,7 +2034,30 @@ async function handleDiscordMessage(message) {
     }
   }
 
-  const signal = await visionParser.parseDiscordMessage(message, trader);
+  // Phase-C: Vision超时隔离（8秒超时+降级）
+  let signal;
+  try {
+    signal = await Promise.race([
+      visionParser.parseDiscordMessage(message, trader),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('VISION_TIMEOUT')), 8000))
+    ]);
+  } catch(visionErr) {
+    if (visionErr.message === 'VISION_TIMEOUT') {
+      console.log(`⏰ [${trader}] Vision 8秒超时，降级到纯文字解析`);
+      logTraceEvent(traceId, 'SKIPPED', { trader, error: 'VISION_TIMEOUT', detail: { text_preview: (textPreview || '').substring(0, 80) } });
+      // 降级：用空signal让后续文字解析兜底
+      signal = visionParser.parseTextSignal ? visionParser.parseTextSignal(textPreview || '') : { coin: null, side: null, entry: null, sl: null, tp: null };
+      // 如果文字解析也不完整（缺entry或sl），直接丢弃
+      if (!signal || !signal.entry || !signal.sl) {
+        console.log(`🚫 [${trader}] Vision超时+文字解析不完整，丢弃信号`);
+        logTraceEvent(traceId, 'SKIPPED', { trader, error: 'VISION_TIMEOUT_NO_FALLBACK' });
+        return;
+      }
+    } else {
+      console.error(`❌ [${trader}] Vision解析错误:`, visionErr.message);
+      signal = { coin: null, side: null, entry: null, sl: null, tp: null };
+    }
+  }
   logTraceEvent(traceId, 'PARSED', { trader, coin: signal.coin, side: signal.side, entry_px: signal.entry, sl_px: signal.sl, detail: { tp: signal.tp, leverage: signal.leverage } });
   const textContent = String(message._overrideText || textPreview || message.content || '');
 
@@ -2950,6 +2994,7 @@ process.on('unhandledRejection', async (reason) => {
 
 // ============== 启动 ==============
 console.log('🚀 正在连接 Discord...\n');
+checkLogRotation(); // Phase-C: 启动时日志轮转
 initSignalDb(); // Signal DB初始化
 // Phase-B: 启动OKX WebSocket
 initOkxWS();
