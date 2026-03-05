@@ -758,6 +758,22 @@ async function calculatePosition(signal, balance, traderWeight = 1.0) {
     console.log(`⚠️ 单笔保证金压缩至 ${contracts}张（单笔上限20%保护）`);
   }
 
+  // 关键修复: 最终保证金不能超过USDT实际可用余额（防51008）
+  const finalMarginActual = (contracts * contract.ctVal * effectiveEntry) / leverage;
+  const usdtAvailCheck = await (async () => {
+    try {
+      const b = await okxReq('GET', '/api/v5/account/balance');
+      const usdt = b.data?.[0]?.details?.find(d => d.ccy === 'USDT');
+      return parseFloat(usdt?.availEq || usdt?.availBal || 0);
+    } catch(e) { return totalEq; }
+  })();
+  if (finalMarginActual > usdtAvailCheck * 0.95) {
+    // 按可用余额90%重新压缩（留5%缓冲）
+    contracts = Math.floor((usdtAvailCheck * 0.9 * leverage) / (contract.ctVal * effectiveEntry));
+    console.log(`⚠️ 按USDT可用余额(${usdtAvailCheck.toFixed(2)}U)压缩至 ${contracts}张（防51008）`);
+    if (contracts < minSz) throw new Error(`USDT可用余额(${usdtAvailCheck.toFixed(2)}U)不足以开最小${minSz}张，拒绝开单`);
+  }
+
   if (contracts <= 0) {
     const slPct = (Math.abs(effectiveEntry - signal.sl) / effectiveEntry * 100).toFixed(1);
     const minAcct = Math.ceil(riskPerContract * minSz / adjustedRisk);
