@@ -938,7 +938,7 @@ async function executeTrade(signal, trader) {
     }
     // 多TP的分批止盈在步骤7处理
 
-    const clientOrderId = `ag_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const clientOrderId = `ag${Date.now()}${Math.random().toString(36).slice(2, 8)}`; // OKX clOrdId不能含下划线
     const orderParams = {
       instId, tdMode: 'cross', side: signal.direction,
       ordType: isLimit ? 'limit' : 'market',
