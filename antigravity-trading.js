@@ -680,6 +680,10 @@ async function calculatePosition(signal, balance, traderWeight = 1.0) {
   let contracts = Math.floor(maxRisk / riskPerContract);
   if (contracts < minSz) contracts = minSz; // 理论上不会到这里，但保险
 
+  // BUG FIX #TDZ: 提前获取账户摘要，避免 totalEq 在 const 声明前被引用（TDZ 报错）
+  const acctSummary = await getAccountSummary();
+  const totalEq = acctSummary?.totalEq || balance;
+
   // ===== P0 FIX: 双重上限保护（防ctVal极小时张数暴增）=====
   const lotSz = parseInt(contract.lotSz) || 1;
   const notionalUsd = contracts * contract.ctVal * effectiveEntry;
@@ -715,10 +719,7 @@ async function calculatePosition(signal, balance, traderWeight = 1.0) {
   // 审计日志
   console.log(`📋 [仓位审计] raw_size=${rawContracts} normalized_size=${contracts} ctVal=${contract.ctVal} notional_usd=${(contracts*contract.ctVal*effectiveEntry).toFixed(0)} cap_rule_hit=${rawContracts!==contracts?'YES':'NO'}`);
 
-  // BUG FIX #3 v2: 全局保证金检查
-  // 用 OKX 账户接口直接返回的 imr（已用初始保证金），不自己累加持仓
-  const acctSummary = await getAccountSummary();
-  const totalEq = acctSummary?.totalEq || balance;
+  // 全局保证金检查（acctSummary 已在上方提前获取）
   const usedMargin = acctSummary?.usedMargin || 0;
   const newMargin = (contracts * contract.ctVal * effectiveEntry) / leverage;
   const totalMarginAfter = usedMargin + newMargin;
@@ -1972,6 +1973,12 @@ async function handleDiscordMessage(message) {
   const trader = channelConfig.name;
   const group = channelConfig.group;
 
+  // Phase-C: 垃圾消息过滤（广告/盗版社区刷屏）
+  const rawText = message.embeds?.[0]?.description || message.content || '';
+  if (/盗\s*版|倒\s*版|聚\s*禾|隨時\s*會斷|費\s*用.*抵\s*扣/.test(rawText)) {
+    return; // 静默丢弃垃圾广告，不浪费Vision调用
+  }
+
   const traceId = message.id; // Discord Snowflake ID = 天然TraceID
   logTraceEvent(traceId, 'RECEIVED', { trader: message.author?.username, channel_id: message.channel?.id });
   // Phase-C: 每1000条消息检查日志大小
@@ -2034,12 +2041,12 @@ async function handleDiscordMessage(message) {
     }
   }
 
-  // Phase-C: Vision超时隔离（8秒超时+降级）
+  // Phase-C: Vision超时隔离（20秒超时+降级）— Gemini Pro需要10-15秒
   let signal;
   try {
     signal = await Promise.race([
       visionParser.parseDiscordMessage(message, trader),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('VISION_TIMEOUT')), 8000))
+      new Promise((_, reject) => setTimeout(() => reject(new Error('VISION_TIMEOUT')), 20000))
     ]);
   } catch(visionErr) {
     if (visionErr.message === 'VISION_TIMEOUT') {
