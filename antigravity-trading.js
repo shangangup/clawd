@@ -977,24 +977,26 @@ async function executeTrade(signal, trader) {
           if (checkedOrder) {
             await sendTG(buildOrderErrorTG(demoTag, trader, signal.pair, errMsg, errCategory, true));
           } else {
-            console.log(`error_category: ${errCategory}`);
+            console.log(`error_category: ${errCategory} | error_msg: ${errMsg} | clOrdId: ${clientOrderId}`);
             await sendTG(buildOrderErrorTG(demoTag, trader, signal.pair, errMsg, errCategory, false));
             return { success: false, error: errMsg };
           }
         } catch (qe) {
           console.log(`❌ 回查确认失败: ${qe.message}`);
-          console.log(`error_category: ${errCategory}`);
+          console.log(`error_category: ${errCategory} | error_msg: ${errMsg} | clOrdId: ${clientOrderId}`);
           await sendTG(buildOrderErrorTG(demoTag, trader, signal.pair, errMsg, errCategory, false));
           return { success: false, error: errMsg };
         }
       } else {
-        console.log(`error_category: ${errCategory}`);
+        console.log(`error_category: ${errCategory} | error_msg: ${errMsg} | clOrdId: ${clientOrderId}`);
         await sendTG(buildOrderErrorTG(demoTag, trader, signal.pair, errMsg, errCategory, false));
         return { success: false, error: errMsg };
       }
     }
 
     if (!orderId && orderResult?.code !== '0') {
+      // 防复发#2: 打印完整OKX错误信息（code+msg+sCode+sMsg+clOrdId）
+      console.log(`❌ [下单失败] code=${orderResult?.code} msg=${orderResult?.msg} sCode=${orderResult?.data?.[0]?.sCode} sMsg=${orderResult?.data?.[0]?.sMsg} clOrdId=${clientOrderId}`);
       // attachAlgoOrds 可能不被支持（某些合约），fallback 到分步下单
       if (orderResult.msg?.includes('attachAlgo') || orderResult.msg?.includes('Parameter')) {
         if (isLimit) {
@@ -3000,6 +3002,11 @@ process.on('unhandledRejection', async (reason) => {
 });
 
 // ============== 启动 ==============
+// 防复发#1: 启动时打印build commit，避免"代码新/进程旧"争议
+try {
+  const BUILD_COMMIT = require('child_process').execSync('git rev-parse --short HEAD', { cwd: __dirname }).toString().trim();
+  console.log(`🚀 Antigravity Trading Bot | build: ${BUILD_COMMIT} | ${new Date().toISOString()}`);
+} catch(e) { console.log(`🚀 Antigravity Trading Bot | build: unknown | ${new Date().toISOString()}`); }
 console.log('🚀 正在连接 Discord...\n');
 checkLogRotation(); // Phase-C: 启动时日志轮转
 initSignalDb(); // Signal DB初始化
