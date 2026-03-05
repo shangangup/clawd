@@ -591,13 +591,18 @@ function buildOrderErrorTG(demoTag, trader, pair, msg, category, recovered = fal
 async function getBalance() {
   const data = await okxReq('GET', '/api/v5/account/balance');
   if (data.code === '0' && data.data?.[0]) {
-    // 用 totalEq（总权益）而非 availBal（可用余额）
-    // 避免持仓占用保证金后 availBal 接近0导致仓位计算失败
-    const totalEq = parseFloat(data.data[0].totalEq || 0);
-    if (totalEq > 0) return totalEq;
-    // fallback: 用 USDT details
+    // FIX: 用USDT的availEq（可用保证金余额），而非多币种totalEq
+    // 防止totalEq包含BTC/ETH等非USDT资产，导致仓位计算远大于实际可用
     const usdt = data.data[0].details?.find(d => d.ccy === 'USDT');
-    return usdt ? parseFloat(usdt.cashBal || usdt.availBal || 0) : 0;
+    if (usdt) {
+      const availEq = parseFloat(usdt.availEq || usdt.availBal || 0);
+      const eq = parseFloat(usdt.eq || usdt.cashBal || 0);
+      console.log(`💰 USDT余额: eq=${eq.toFixed(2)} availEq=${availEq.toFixed(2)}`);
+      return eq > 0 ? eq : availEq; // 用eq（USDT总权益）计算仓位上限，availEq用于实际可用检查
+    }
+    // fallback: 用totalEq
+    const totalEq = parseFloat(data.data[0].totalEq || 0);
+    return totalEq;
   }
   return 0;
 }
@@ -607,12 +612,23 @@ async function getAccountSummary() {
   try {
     const data = await okxReq('GET', '/api/v5/account/balance');
     if (data.code === '0' && data.data?.[0]) {
-      return {
-        totalEq: parseFloat(data.data[0].totalEq || 0),
-        availEq: parseFloat(data.data[0].adjEq || data.data[0].totalEq || 0),
-        usedMargin: parseFloat(data.data[0].imr || 0),  // OKX直接返回已用保证金
-        mgnRatio: parseFloat(data.data[0].mgnRatio || 0),
-      };
+      const acct = data.data[0];
+      // OKX /api/v5/account/balance: imr/adjEq 在顶层可能为空，需从持仓单独查
+      // 用 /api/v5/account/positions 累加 imr 得到已用保证金
+      let usedMargin = 0;
+      try {
+        const posData = await okxReq('GET', '/api/v5/account/positions?instType=SWAP');
+        if (posData.code === '0') {
+          usedMargin = (posData.data || [])
+            .filter(p => parseFloat(p.pos) !== 0)
+            .reduce((sum, p) => sum + parseFloat(p.imr || 0), 0);
+        }
+      } catch(pe) { console.log(`⚠️ 获取持仓保证金失败: ${pe.message}`); }
+
+      const totalEq = parseFloat(acct.totalEq || 0);
+      const availEq = parseFloat(acct.adjEq || acct.totalEq || 0);
+      console.log(`💰 账户状态: totalEq=${totalEq.toFixed(2)} availEq=${availEq.toFixed(2)} usedMargin=${usedMargin.toFixed(2)} 占比=${(usedMargin/totalEq*100).toFixed(1)}%`);
+      return { totalEq, availEq, usedMargin, mgnRatio: parseFloat(acct.mgnRatio || 0) };
     }
   } catch (e) {
     console.log(`⚠️ getAccountSummary 失败: ${e.message}`);
@@ -682,7 +698,9 @@ async function calculatePosition(signal, balance, traderWeight = 1.0) {
 
   // BUG FIX #TDZ: 提前获取账户摘要，避免 totalEq 在 const 声明前被引用（TDZ 报错）
   const acctSummary = await getAccountSummary();
-  const totalEq = acctSummary?.totalEq || balance;
+  // FIX: 用USDT可用余额(而非多币种总权益)来计算仓位/保证金，防止OKX 51008
+  const usdtAvail = await getBalance(); // USDT可用余额
+  const totalEq = usdtAvail > 0 ? usdtAvail : (acctSummary?.totalEq || balance);
 
   // ===== P0 FIX: 双重上限保护（防ctVal极小时张数暴增）=====
   const lotSz = parseInt(contract.lotSz) || 1;
