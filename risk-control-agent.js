@@ -564,7 +564,7 @@ async function geminiValidation(signal, hardRulesResult, marketData) {
     console.log('⚠️  Gemini AI 未配置，启用本地规则降级验证...');
     // 降级模式：本地规则补充检查（RR + 流动性 + 成交量）
     const fallbackChecks = [];
-    // RR检查
+    // RR检查：有TP才验证RR；无TP则跳过（交易员不发TP很常见），仅做止损距离检查
     if (signal.entry && signal.sl && signal.tp?.length > 0) {
       const risk = Math.abs(signal.entry - signal.sl);
       const reward = Math.abs(signal.tp[0] - signal.entry);
@@ -573,6 +573,13 @@ async function geminiValidation(signal, hardRulesResult, marketData) {
         return { passed: false, reason: `降级验证: RR=${rr.toFixed(2)} 低于1.5`, data: { rr } };
       }
       fallbackChecks.push(`RR=${rr.toFixed(2)} ✅`);
+    } else if (signal.entry && signal.sl) {
+      // 无TP: 只验证止损距离合理（不超过15%），不卡RR
+      const slDist = Math.abs(signal.entry - signal.sl) / signal.entry;
+      if (slDist > 0.15) {
+        return { passed: false, reason: `降级验证: 无TP且止损距离过大${(slDist*100).toFixed(1)}%`, data: { slDist } };
+      }
+      fallbackChecks.push(`无TP-止损距离${(slDist*100).toFixed(1)}% ✅`);
     }
     // 流动性检查（24h成交额>100万U）
     if (marketData?.volCcy24h) {
