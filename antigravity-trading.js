@@ -2098,29 +2098,32 @@ async function handleDiscordMessage(message) {
     }
   }
 
-  // Phase-C: Vision超时隔离（20秒超时+降级）— Gemini Pro需要10-15秒
+  // Phase-C: Vision超时隔离（20秒超时+降级）— 超时后降级到文字解析，不丢弃
   let signal;
+  let visionFailed = false;
   try {
     signal = await Promise.race([
       visionParser.parseDiscordMessage(message, trader),
       new Promise((_, reject) => setTimeout(() => reject(new Error('VISION_TIMEOUT')), 20000))
     ]);
   } catch(visionErr) {
+    visionFailed = true;
     if (visionErr.message === 'VISION_TIMEOUT') {
-      console.log(`⏰ [${trader}] Vision 8秒超时，降级到纯文字解析`);
-      logTraceEvent(traceId, 'SKIPPED', { trader, error: 'VISION_TIMEOUT', detail: { text_preview: (textPreview || '').substring(0, 80) } });
-      // 降级：用空signal让后续文字解析兜底
-      signal = visionParser.parseTextSignal ? visionParser.parseTextSignal(textPreview || '') : { coin: null, side: null, entry: null, sl: null, tp: null };
-      // 如果文字解析也不完整（缺entry或sl），直接丢弃
-      if (!signal || !signal.entry || !signal.sl) {
-        console.log(`🚫 [${trader}] Vision超时+文字解析不完整，丢弃信号`);
-        logTraceEvent(traceId, 'SKIPPED', { trader, error: 'VISION_TIMEOUT_NO_FALLBACK' });
-        return;
-      }
+      console.log(`⏰ [${trader}] Vision超时，降级到纯文字解析`);
+      logTraceEvent(traceId, 'VISION_TIMEOUT', { trader, detail: { text_preview: (textPreview || '').substring(0, 80) } });
     } else {
-      console.error(`❌ [${trader}] Vision解析错误:`, visionErr.message);
-      signal = { coin: null, side: null, entry: null, sl: null, tp: null };
+      console.log(`⚠️ [${trader}] Vision解析错误: ${visionErr.message}，降级到文字解析`);
     }
+    // 降级：直接用文字解析（不丢弃，让后续验证层处理）
+    signal = visionParser.parseTextSignal ? visionParser.parseTextSignal(textPreview || '') : null;
+    if (!signal || (!signal.coin && !signal.direction)) {
+      // 文字解析也完全没有信号，才丢弃
+      console.log(`🚫 [${trader}] Vision超时+文字无信号特征，丢弃`);
+      logTraceEvent(traceId, 'SKIPPED', { trader, error: 'VISION_TIMEOUT_NO_SIGNAL' });
+      return;
+    }
+    // 有方向信息但可能缺entry/sl，继续走，后续会检查
+    console.log(`📝 [${trader}] 文字降级结果: ${signal.coin} ${signal.direction} entry=${signal.entry} sl=${signal.sl}`);
   }
   logTraceEvent(traceId, 'PARSED', { trader, coin: signal.coin, side: signal.side, entry_px: signal.entry, sl_px: signal.sl, detail: { tp: signal.tp, leverage: signal.leverage } });
   const textContent = String(message._overrideText || textPreview || message.content || '');
