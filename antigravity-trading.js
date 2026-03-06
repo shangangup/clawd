@@ -588,52 +588,41 @@ function buildOrderErrorTG(demoTag, trader, pair, msg, category, recovered = fal
 }
 
 // ============== 余额 ==============
-async function getBalance() {
-  const data = await okxReq('GET', '/api/v5/account/balance');
-  if (data.code === '0' && data.data?.[0]) {
-    // FIX: 用USDT的availEq（可用保证金余额），而非多币种totalEq
-    // 防止totalEq包含BTC/ETH等非USDT资产，导致仓位计算远大于实际可用
-    const usdt = data.data[0].details?.find(d => d.ccy === 'USDT');
-    if (usdt) {
-      const availEq = parseFloat(usdt.availEq || usdt.availBal || 0);
-      const eq = parseFloat(usdt.eq || usdt.cashBal || 0);
-      console.log(`💰 USDT余额: eq=${eq.toFixed(2)} availEq=${availEq.toFixed(2)}`);
-      return eq > 0 ? eq : availEq; // 用eq（USDT总权益）计算仓位上限，availEq用于实际可用检查
-    }
-    // fallback: 用totalEq
-    const totalEq = parseFloat(data.data[0].totalEq || 0);
-    return totalEq;
+// ============== 统一账户快照（太尉规格：所有风控/仓位计算共用同一数据源） ==============
+async function getAccountSnapshot() {
+  try {
+    // 1. 查USDT余额
+    const balData = await okxReq('GET', '/api/v5/account/balance');
+    const usdt = balData.data?.[0]?.details?.find(d => d.ccy === 'USDT');
+    const usdtEq = parseFloat(usdt?.eq || 0);
+    const usdtAvail = parseFloat(usdt?.availEq || usdt?.availBal || 0);
+
+    // 2. 查持仓保证金（从positions累加imr）
+    let usedMargin = 0;
+    try {
+      const posData = await okxReq('GET', '/api/v5/account/positions?instType=SWAP');
+      usedMargin = (posData.data || [])
+        .filter(p => parseFloat(p.pos) !== 0)
+        .reduce((sum, p) => sum + parseFloat(p.imr || 0), 0);
+    } catch(pe) { console.log(`⚠️ 获取持仓保证金失败: ${pe.message}`); }
+
+    console.log(`💰 [账户快照] usdtEq=${usdtEq.toFixed(2)} usdtAvail=${usdtAvail.toFixed(2)} usedMargin=${usedMargin.toFixed(2)} 占比=${usdtEq>0?(usedMargin/usdtEq*100).toFixed(1):0}%`);
+    return { usdtEq, usdtAvail, usedMargin, totalEq: parseFloat(balData.data?.[0]?.totalEq || 0) };
+  } catch(e) {
+    console.log(`⚠️ [账户快照] 获取失败: ${e.message}`);
+    return null;
   }
-  return 0;
 }
 
-// 快速获取账户详情（totalEq + usedMargin 一次调用）
+// 向后兼容：getBalance 和 getAccountSummary 都走统一快照
+async function getBalance() {
+  const snap = await getAccountSnapshot();
+  return snap?.usdtEq || 0;
+}
 async function getAccountSummary() {
-  try {
-    const data = await okxReq('GET', '/api/v5/account/balance');
-    if (data.code === '0' && data.data?.[0]) {
-      const acct = data.data[0];
-      // OKX /api/v5/account/balance: imr/adjEq 在顶层可能为空，需从持仓单独查
-      // 用 /api/v5/account/positions 累加 imr 得到已用保证金
-      let usedMargin = 0;
-      try {
-        const posData = await okxReq('GET', '/api/v5/account/positions?instType=SWAP');
-        if (posData.code === '0') {
-          usedMargin = (posData.data || [])
-            .filter(p => parseFloat(p.pos) !== 0)
-            .reduce((sum, p) => sum + parseFloat(p.imr || 0), 0);
-        }
-      } catch(pe) { console.log(`⚠️ 获取持仓保证金失败: ${pe.message}`); }
-
-      const totalEq = parseFloat(acct.totalEq || 0);
-      const availEq = parseFloat(acct.adjEq || acct.totalEq || 0);
-      console.log(`💰 账户状态: totalEq=${totalEq.toFixed(2)} availEq=${availEq.toFixed(2)} usedMargin=${usedMargin.toFixed(2)} 占比=${(usedMargin/totalEq*100).toFixed(1)}%`);
-      return { totalEq, availEq, usedMargin, mgnRatio: parseFloat(acct.mgnRatio || 0) };
-    }
-  } catch (e) {
-    console.log(`⚠️ getAccountSummary 失败: ${e.message}`);
-  }
-  return null;
+  const snap = await getAccountSnapshot();
+  if (!snap) return null;
+  return { totalEq: snap.usdtEq, availEq: snap.usdtAvail, usedMargin: snap.usedMargin, mgnRatio: 0 };
 }
 
 // ============== 合约信息 ==============
@@ -759,19 +748,23 @@ async function calculatePosition(signal, balance, traderWeight = 1.0) {
   }
 
   // 关键修复: 最终保证金不能超过USDT实际可用余额（防51008）
+  // 复用已有的 acctSummary（getAccountSnapshot已查过），不再重复查OKX
   const finalMarginActual = (contracts * contract.ctVal * effectiveEntry) / leverage;
-  const usdtAvailCheck = await (async () => {
-    try {
-      const b = await okxReq('GET', '/api/v5/account/balance');
-      const usdt = b.data?.[0]?.details?.find(d => d.ccy === 'USDT');
-      return parseFloat(usdt?.availEq || usdt?.availBal || 0);
-    } catch(e) { return totalEq; }
-  })();
+  const usdtAvailCheck = acctSummary?.availEq ?? totalEq;
+  const marginBefore = finalMarginActual;
   if (finalMarginActual > usdtAvailCheck * 0.95) {
-    // 按可用余额90%重新压缩（留5%缓冲）
+    const contractsBefore = contracts;
     contracts = Math.floor((usdtAvailCheck * 0.9 * leverage) / (contract.ctVal * effectiveEntry));
-    console.log(`⚠️ 按USDT可用余额(${usdtAvailCheck.toFixed(2)}U)压缩至 ${contracts}张（防51008）`);
-    if (contracts < minSz) throw new Error(`USDT可用余额(${usdtAvailCheck.toFixed(2)}U)不足以开最小${minSz}张，拒绝开单`);
+    const marginAfter = (contracts * contract.ctVal * effectiveEntry) / leverage;
+    // 太尉要求1: 压缩命中日志
+    console.log(`⚠️ [仓位压缩] raw_size=${contractsBefore}张 compressed_size=${contracts}张 availEq=${usdtAvailCheck.toFixed(2)}U requiredMargin_before=${marginBefore.toFixed(2)}U requiredMargin_after=${marginAfter.toFixed(2)}U`);
+    if (contracts < minSz) {
+      // 太尉要求2: 低avail边界—压缩后不足最小张数，硬拒单
+      throw new Error(`USDT可用余额(${usdtAvailCheck.toFixed(2)}U)不足以开最小${minSz}张（压缩后${contracts}张），请先释放保证金`);
+    }
+  } else {
+    // 太尉要求2: 充足边界—不误压缩，保留原尺寸
+    console.log(`✅ [仓位校验] 保证金充足，不压缩 contracts=${contracts}张 margin=${finalMarginActual.toFixed(2)}U availEq=${usdtAvailCheck.toFixed(2)}U`);
   }
 
   if (contracts <= 0) {
@@ -1045,9 +1038,37 @@ async function executeTrade(signal, trader) {
       }
 
       const orderMsg = orderResult?.msg || 'unknown error';
+      const sCode = orderResult?.data?.[0]?.sCode;
+      const sMsg = orderResult?.data?.[0]?.sMsg || '';
       const errCategory = classifyOrderErrorCategory(orderMsg);
 
-      if (errCategory === 'network_timeout') {
+      // 太尉要求3: 51008保证金不足—二次压缩重试一次+告警
+      if (sCode === '51008') {
+        console.log(`⚠️ [51008兜底] 交易所拒单: sCode=${sCode} sMsg=${sMsg} clOrdId=${clientOrderId}`);
+        console.log(`⚠️ [51008兜底] usdtEq=${pos?.usdtEq||'?'} usdtAvail=${pos?.usdtAvail||'?'} usedMargin=${pos?.usedMargin||'?'} requiredMargin=${pos?.margin||'?'} leverage=${pos?.leverage||'?'}`);
+        // 二次压缩：减半张数重试一次
+        const origContracts = parseInt(orderParams.sz);
+        const retryContracts = Math.floor(origContracts / 2);
+        if (retryContracts >= (parseInt(contract?.minSz) || 1)) {
+          const retryClOrdId = `ag${Date.now()}${Math.random().toString(36).slice(2,6)}`;
+          const retryParams = { ...orderParams, sz: retryContracts.toString(), clOrdId: retryClOrdId };
+          console.log(`🔄 [51008兜底] 二次尝试: ${origContracts}张→${retryContracts}张 clOrdId=${retryClOrdId}`);
+          const retryResult = await okxReq('POST', '/api/v5/trade/order', retryParams);
+          await sendTG(`⚠️ <b>51008二次压缩告警</b>\n\n${trader} ${signal.pair}\norig=${origContracts}张 retry=${retryContracts}张\nretry_code=${retryResult?.code} retry_sCode=${retryResult?.data?.[0]?.sCode||'OK'}`);
+          if (retryResult?.code === '0' && retryResult?.data?.[0]?.ordId) {
+            orderId = retryResult.data[0].ordId;
+            slAlgoId = retryResult.data[0].attachAlgoOrds?.[0]?.algoId || 'attached';
+            console.log(`✅ [51008兜底] 二次下单成功 ordId=${orderId}`);
+          } else {
+            console.log(`❌ [51008兜底] 二次下单仍失败: sCode=${retryResult?.data?.[0]?.sCode} sMsg=${retryResult?.data?.[0]?.sMsg}`);
+            await sendTG(`🛑 <b>下单彻底失败(51008)</b>\n\n${trader} ${signal.pair}\n${sMsg}\n请检查账户保证金`);
+            return { success: false, error: `51008: ${sMsg}` };
+          }
+        } else {
+          await sendTG(`🛑 <b>保证金严重不足(51008)</b>\n\n${trader} ${signal.pair}\n可用余额不足以开最小仓位，请释放保证金后再试`);
+          return { success: false, error: `51008: 保证金不足且无法压缩` };
+        }
+      } else if (errCategory === 'network_timeout') {
         try {
           const checkedOrder = await queryByClientId();
           if (checkedOrder) {
